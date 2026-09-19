@@ -3,8 +3,9 @@
 批量提交邮件头信息（`message_id`、`in_reply_to`、`references`、发送时间、主题，
 以及可选的保留截止时间 `retain_until`），服务将其归并为**稳定排序的会话树**，
 并给出**重复 ID、缺失引用、引用环**三类诊断。批次请求与归并结果均持久化到 SQLite，
-可随时查询。此外支持**会话活跃冻结 / 解除冻结**与按保留期的**到期批量清理**
-（删除中间节点时自动压缩会话树，支持 `dry_run` 预览）。
+可随时查询。此外支持**会话活跃冻结 / 解除冻结**、按保留期的**到期批量清理**
+（删除中间节点时自动压缩会话树，支持 `dry_run` 预览），以及**人工会话纠偏**
+（`POST /thread-corrections`，带 revision 乐观校验地调整任一有效邮件的父节点）。
 
 ## 一条命令启动
 
@@ -49,8 +50,9 @@ ports:
 | `GET` | `/batches?limit=50&offset=0` | 批次列表，按提交时间倒序 |
 | `GET` | `/batches/{batch_id}` | 取该批次的归档结果快照（与提交响应完全一致） |
 | `POST` | `/relinks` | 迟到邮件归档后，批量修复此前断链的有效邮件（HTTP 200） |
+| `POST` | `/thread-corrections` | **人工会话纠偏**：调整一封有效邮件的父节点（`null` 拆成根），带 revision 乐观校验（HTTP 200） |
 | `GET` | `/messages/{message_id}` | 查询单封邮件及其最终父节点（含 `retain_until` 与 `frozen` 状态） |
-| `GET` | `/threads/{message_id}` | 查询该邮件所属完整会话树；环邮件返回 **409** |
+| `GET` | `/threads/{message_id}` | 查询该邮件所属完整会话树与当前拓扑 `revision`；环邮件返回 **409** |
 | `GET` | `/threads/{message_id}/page?limit=&cursor=` | 会话树**游标分页**（先序扁平展开，含 `depth`），适配大型会话 |
 | `POST` | `/retention/freezes` | **活跃冻结**某封有效邮件当前所在的整棵会话（保护范围随会话拓扑自动扩张） |
 | `POST` | `/retention/unfreezes` | **解除**以某封邮件为锚点的冻结 |
@@ -64,6 +66,8 @@ ports:
 未知 ID：批次 / 邮件查询、`/relinks` 返回 **404**；请求体不合法返回 **422**；
 `/relinks` 若合并候选关系后形成环，整次返回 **409** 且不写库。冻结锚点未知
 返回 **404**，锚点为环内邮件返回 **409**；解除一个不存在的冻结返回 **404**。
+`POST /thread-corrections` 的错误码见下节（待调整邮件 / 目标父未知 **404**；
+环内邮件、revision 不匹配、自挂/成环均为 **409** 且不写库）。
 
 ### 大型会话分页：`GET /threads/{message_id}/page`
 
@@ -76,8 +80,9 @@ ports:
 - `limit` 限定 **1～200**（默认 50）；取到末页时 `next_cursor` 为 `null`；
 - 游标封装**根 ID、下一偏移与 revision**：revision 根据整棵树每个节点的
   `message_id` / `parent_id` / `sent_at` 计算。后续请求**必须重新计算
-  revision**——若会话树在此期间被补链（`POST /relinks`）或新邮件并入而
-  发生变化，返回 **409** `{"detail": {"error": "cursor_stale", …}}`，
+  revision**——若会话树在此期间被补链（`POST /relinks`）、人工纠偏
+  （`POST /thread-corrections`）、保留期清理压缩或新邮件并入而发生变化，
+  返回 **409** `{"detail": {"error": "cursor_stale", …}}`，
   调用方应丢弃游标、从第一页重新开始，从而避免跨页漏项或重复；
 - 游标格式错误（无法解析、字段缺失/非法、版本不符）返回 **422**；
   游标来自**另一棵会话树**（与路径 `message_id` 当前所属会话不符）同样
@@ -251,6 +256,91 @@ curl -X POST http://localhost:8000/relinks -H 'Content-Type: application/json' \
 }
 ```
 
+### 人工会话纠偏：`POST /thread-corrections`
+
+自动归并可能因邮件头缺失 / 迟到而挂错会话；本接口允许运维**人工调整任一有效
+邮件的父节点**，把邮件移到另一封有效邮件下，或传入 `new_parent_id: null`
+把该邮件（连同其子树）**拆成新的根**。
+
+`GET /threads/{message_id}` 的响应在 `root_id` / `tree` 之外还带有当前整棵
+会话拓扑的 `revision`（与分页游标使用同一摘要：按每个节点的
+`message_id` / `parent_id` / `sent_at` 计算）：
+
+```bash
+curl http://localhost:8000/threads/C
+```
+
+```jsonc
+{
+  "root_id": "A",
+  "revision": "9f1a…（64 位十六进制）",
+  "tree": { "message_id": "A", "parent_id": null, "children": [ … ] }
+}
+```
+
+纠偏时把读到的 revision 原样放入 `expected_revision`，作为**乐观并发校验**：
+
+- 仅允许调整**有效邮件**（引用环之外），目标父节点也必须有效（存在且非环内
+  `invalid` 邮件）：待调整邮件不存在 **404**；目标父不存在 **404**
+  （`detail.new_parent_id` 给出该 ID）；任一为环内邮件 **409**；
+- revision 必须等于该邮件**当前所在整棵会话拓扑**的 revision；自读取后若
+  会话被补链、纠偏、清理压缩或新邮件并入而改变，返回 **409**
+  `{"detail": {"error": "revision_conflict", "current_revision": "…"}}`，
+  **不写库**；调用方应重新 `GET /threads` 取得 `current_revision` 后重试；
+- **禁止自挂**（`new_parent_id` 等于 `message_id`，构成单节点环），**禁止
+  挂到自身后代下**形成引用环：候选关系合并到既有父指针图上统一检测，命中时
+  整次返回 **409**（`detail.cycles` 给出环成员）且**不写库**；
+- 校验通过后在**单个事务**内更新 `parent_id`（仅父指针，不改动邮件头
+  `in_reply_to` / `references`），返回节点调整前后的父节点、根节点以及
+  **新 revision**（随即 `GET /threads/{message_id}` 得到的就是同一值）；
+  目标与当前父节点相同属于无变更操作，revision 保持不变；
+- **既有批次结果快照与诊断明细永不改写**（`GET /batches/{id}` 仍返回归档
+  时原样）；纠偏前领取的分页游标会收到 **409** `cursor_stale`；
+- **活跃冻结按新拓扑自然生效**：锚点不保存成员快照，邮件被移入受冻结会话即
+  自动受保护，被拆出 / 移出受冻结会话即自动失去保护，无需重新冻结。
+
+```bash
+# 把 C 从 A 树下移到 Q 下（Q 在另一棵会话中）
+curl -X POST http://localhost:8000/thread-corrections \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "message_id": "C",
+    "new_parent_id": "Q",
+    "expected_revision": "9f1a…（GET /threads/C 读到的 revision）"
+  }'
+```
+
+```jsonc
+{
+  "message_id": "C",
+  "old_parent_id": "A",   // 调整前的父节点
+  "new_parent_id": "Q",   // 调整后的父节点（为 null 表示已拆成根）
+  "old_root_id": "A",     // 调整前所在会话的根
+  "new_root_id": "P",     // 调整后所在会话的根
+  "revision": "3c2b…"     // 调整后新会话拓扑的 revision
+}
+```
+
+拆成根时把 `new_parent_id` 置为 `null`（该字段必填；空字符串返回 **422**）：
+
+```bash
+curl -X POST http://localhost:8000/thread-corrections \
+  -H 'Content-Type: application/json' \
+  -d '{"message_id": "C", "new_parent_id": null, "expected_revision": "9f1a…"}'
+```
+
+revision 不匹配时（HTTP **409**，不写库）：
+
+```json
+{
+  "detail": {
+    "error": "revision_conflict",
+    "message": "expected_revision does not match the current thread topology; no changes were written",
+    "current_revision": "d04e…"
+  }
+}
+```
+
 ## 保留期：冻结与到期清理
 
 归档时可给邮件设置可选的 `retain_until`（保留截止时间）：
@@ -299,8 +389,9 @@ curl -X POST http://localhost:8000/retention/freezes \
 冻结语义（**活跃冻结**，不保存成员快照）：
 
 - 冻结只记录锚点，保护范围是锚点**当前**所在的整棵会话，随会话拓扑实时扩张：
-  此后经**新批次归档**或 **`POST /relinks`** 并入该会话的邮件**自动受保护**，
-  无需再次冻结；
+  此后经**新批次归档**、**`POST /relinks`** 或**人工纠偏
+  （`POST /thread-corrections`）**并入该会话的邮件自动受保护；被纠偏拆出 /
+  移出该会话的邮件则自动失去保护，均无需再次冻结；
 - 对同一锚点再次调用即为**刷新**（`created: false`），仅更新 `frozen_at`；
   响应中的 `members` 始终反映调用时刻的当前会话成员；
 - 同一棵会话可以由不同锚点多次冻结，保护取**并集**；解除其中一个锚点
@@ -411,13 +502,14 @@ SQLite（WAL 模式），表在服务启动时自动创建：
 - `batches`：批次元数据与计数；
 - `messages`：每封唯一邮件、最终 `parent_id`、是否 `is_invalid`、可选 `retain_until`；
 - `batch_duplicates` / `batch_missing_refs` / `batch_cycles`：诊断明细；
-- `batch_results`：完整结果 JSON 快照，`GET /batches/{id}` 原样返回（补链、保留期
-  清理只更新/删除 `messages`，快照与诊断表永不改写）；
+- `batch_results`：完整结果 JSON 快照，`GET /batches/{id}` 原样返回（补链、人工
+  纠偏、保留期清理只更新/删除 `messages`，快照与诊断表永不改写）；
 - `retention_freezes`：冻结锚点（活跃冻结不存成员快照；保护集合在使用时按当前
   父子关系实时展开锚点所在会话计算）。
 
-写操作在进程内串行化（线程锁 + 单连接写事务），保证并发提交 / 补链 / 冻结 /
-清理下的归并一致性；保留期实际清理的全部重挂与删除在**单个事务**内提交。
+写操作在进程内串行化（线程锁 + 单连接写事务），保证并发提交 / 补链 / 纠偏 /
+冻结 / 清理下的归并一致性；补链、人工纠偏、保留期实际清理的全部父指针变更与
+删除均在**单个事务**内提交。
 
 服务启动的建表 DDL 幂等；早期数据库（`messages` 无 `retain_until` 列、含旧版
 冻结成员快照表 `retention_freeze_members`）会在启动时自动补列、并删除已废弃的

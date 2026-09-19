@@ -148,6 +148,65 @@ class MessageOut(BaseModel):
     frozen: bool = Field(False, description="当前是否被任一活跃会话冻结保护")
 
 
+class ThreadNodeOut(BaseModel):
+    """GET /threads/{message_id}：完整会话树 + 当前整棵会话拓扑的 revision。"""
+
+    root_id: str
+    tree: Optional["TreeNode"]
+    revision: str = Field(
+        ...,
+        description=(
+            "按当前整棵会话拓扑（每个节点的 message_id / parent_id / sent_at）"
+            "计算的摘要；拓扑变化（补链、纠偏、清理压缩、新邮件并入）后改变"
+        ),
+    )
+
+
+class ThreadCorrectionIn(BaseModel):
+    """POST /thread-corrections：人工调整一封有效邮件的父节点。"""
+
+    message_id: str = Field(..., min_length=1, description="待调整邮件 ID（必须是引用环外的有效邮件）")
+    new_parent_id: Optional[str] = Field(
+        None, description="新父节点 ID（必须为有效邮件）；null 表示把该邮件拆成新的根"
+    )
+    expected_revision: str = Field(
+        ...,
+        min_length=1,
+        description="调用方最近一次 GET /threads/{message_id} 得到的 revision；与当前拓扑不匹配返回 409 且不写库",
+    )
+
+    @field_validator("message_id", "expected_revision")
+    @classmethod
+    def _strip_required(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("value must not be empty")
+        return v
+
+    @field_validator("new_parent_id")
+    @classmethod
+    def _strip_parent(cls, v: Optional[str]) -> Optional[str]:
+        # null 是合法取值（拆成根）；空字符串/纯空白不是合法 ID
+        if v is None:
+            return None
+        v = v.strip()
+        if not v:
+            raise ValueError("new_parent_id must be null or a non-empty message id")
+        return v
+
+
+class ThreadCorrectionResult(BaseModel):
+    message_id: str
+    old_parent_id: Optional[str] = Field(..., description="调整前的父节点（拆根前可能已在某节点下）")
+    new_parent_id: Optional[str] = Field(..., description="调整后的父节点；null 表示已拆为根")
+    old_root_id: str = Field(..., description="调整前该邮件所在会话的根")
+    new_root_id: str = Field(..., description="调整后该邮件所在会话的根")
+    revision: str = Field(
+        ...,
+        description="调整后该邮件当前所在整棵会话的新 revision（随即 GET /threads/{message_id} 得到同一值）",
+    )
+
+
 class RelinkItem(BaseModel):
     message_id: str
     old_parent_id: Optional[str]

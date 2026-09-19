@@ -13,7 +13,14 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from . import database, threading
-from .schemas import BatchIn, CleanupIn, FreezeIn, RelinkIn, UnfreezeIn
+from .schemas import (
+    BatchIn,
+    CleanupIn,
+    FreezeIn,
+    RelinkIn,
+    ThreadCorrectionIn,
+    UnfreezeIn,
+)
 from .threading import RetentionCleanupPlan, ThreadMessage
 
 
@@ -55,6 +62,42 @@ class RetentionAnchorInvalid(Exception):
 
 class RetentionFreezeNotFound(Exception):
     """解除冻结：不存在以该邮件为锚点的冻结（-> 404）。"""
+
+
+class CorrectionMessageNotFound(Exception):
+    """POST /thread-corrections：待调整邮件未归档（-> 404）。"""
+
+
+class CorrectionParentNotFound(Exception):
+    """POST /thread-corrections：目标父节点未归档（-> 404）。"""
+
+    def __init__(self, parent_id: str) -> None:
+        self.parent_id = parent_id
+        super().__init__(f"parent not found: {parent_id}")
+
+
+class CorrectionInvalidMessage(Exception):
+    """POST /thread-corrections：待调整邮件是引用环内 invalid 邮件（-> 409）。"""
+
+
+class CorrectionInvalidParent(Exception):
+    """POST /thread-corrections：目标父节点是引用环内 invalid 邮件（-> 409）。"""
+
+
+class CorrectionRevisionConflict(Exception):
+    """expected_revision 与当前会话拓扑不匹配（-> 409，不写库）。"""
+
+    def __init__(self, current_revision: str) -> None:
+        self.current_revision = current_revision
+        super().__init__(f"revision conflict; current revision is {current_revision}")
+
+
+class CorrectionCycleConflict(Exception):
+    """调整会导致自挂或引用环（-> 409，不写库）。"""
+
+    def __init__(self, cycles: list[list[str]]) -> None:
+        self.cycles = cycles
+        super().__init__(f"correction would create cycles: {cycles}")
 
 
 # 游标载荷版本号；编码结构调整时可据此区分。
@@ -542,7 +585,7 @@ def get_message(message_id: str) -> Optional[dict]:
 
 
 def get_thread(message_id: str) -> Optional[dict]:
-    """返回某邮件所在会话的完整树。环邮件不挂接，返回 409。"""
+    """返回某邮件所在会话的完整树与当前 revision。环邮件不挂接，返回 409。"""
 
     conn = database.connect()
     try:
@@ -557,9 +600,116 @@ def get_thread(message_id: str) -> Optional[dict]:
         root_id = _climb_root(conn, message_id)
         msgs, parents = _load_subtree(conn, root_id)
         forest = threading.build_forest(msgs, parents)
-        return {"root_id": root_id, "tree": forest[0] if forest else None}
+        return {
+            "root_id": root_id,
+            "tree": forest[0] if forest else None,
+            "revision": _tree_revision(msgs, parents),
+        }
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# POST /thread-corrections：人工会话纠偏
+# ---------------------------------------------------------------------------
+
+
+def correct_thread(payload: ThreadCorrectionIn) -> dict:
+    """人工调整一封有效邮件的父节点（new_parent_id 为 None 即拆成根）。
+
+    - 仅允许调整引用环之外的有效邮件，目标父节点也必须有效（存在且非环）：
+      待调整邮件/目标父不存在 -> 404；任一为环内 invalid 邮件 -> 409；
+    - expected_revision 必须等于该邮件**当前所在整棵会话拓扑**的 revision
+      （即 GET /threads/{message_id} 最近返回的值），不匹配 -> 409 且不写库，
+      响应 detail 给出当前 revision 供调用方重新读取；
+    - 禁止自挂（new_parent_id == message_id），禁止把节点挂到自身后代下
+      形成引用环：候选关系合并到既有父指针图上统一检测，命中 -> 409
+      （给出环成员）且不写库；
+    - 通过后在单事务内更新 parent_id，并基于新拓扑重新装载整棵会话计算
+      新 revision；返回节点调整前后的父节点、根节点与新 revision。
+    批次快照与诊断明细不参与、不改写；活跃冻结按新拓扑自然生效。
+    """
+
+    message_id = payload.message_id
+    new_parent_id = payload.new_parent_id
+
+    with database.write_lock():
+        conn = database.connect()
+        try:
+            # 单事务视图：revision 校验、环检测与写入基于同一快照
+            conn.execute("BEGIN IMMEDIATE")
+
+            row = conn.execute(
+                "SELECT parent_id, is_invalid FROM messages WHERE message_id = ?",
+                (message_id,),
+            ).fetchone()
+            if row is None:
+                raise CorrectionMessageNotFound("message not found")
+            if row["is_invalid"]:
+                raise CorrectionInvalidMessage(
+                    "message belongs to a reference cycle and is not attached to any thread"
+                )
+            old_parent_id = row["parent_id"]
+
+            if new_parent_id is not None:
+                prow = conn.execute(
+                    "SELECT is_invalid FROM messages WHERE message_id = ?",
+                    (new_parent_id,),
+                ).fetchone()
+                if prow is None:
+                    raise CorrectionParentNotFound(new_parent_id)
+                if prow["is_invalid"]:
+                    raise CorrectionInvalidParent(
+                        "new_parent_id belongs to a reference cycle and is not attached to any thread"
+                    )
+
+            # 既有整图：全部有效邮件的当前父指针
+            base_parents: dict[str, Optional[str]] = {
+                r["message_id"]: r["parent_id"]
+                for r in conn.execute(
+                    "SELECT message_id, parent_id FROM messages WHERE is_invalid = 0"
+                )
+            }
+
+            # revision 以该邮件当前所在的整棵会话拓扑计算（与 GET /threads 一致）
+            old_root_id = _climb_root_inmem(message_id, base_parents)
+            cur_msgs, cur_parents = _load_subtree(conn, old_root_id)
+            if payload.expected_revision != _tree_revision(cur_msgs, cur_parents):
+                raise CorrectionRevisionConflict(
+                    _tree_revision(cur_msgs, cur_parents)
+                )
+
+            # 候选关系合并到既有图上统一检测环（自挂即单节点环）
+            merged_parents = dict(base_parents)
+            merged_parents[message_id] = new_parent_id
+            cycles = threading.find_cycles(merged_parents)
+            if cycles:
+                raise CorrectionCycleConflict(cycles)
+
+            conn.execute(
+                "UPDATE messages SET parent_id = ? WHERE message_id = ?",
+                (new_parent_id, message_id),
+            )
+
+            # 新拓扑：重新装载该邮件当前所在整棵会话并计算新 revision
+            new_root_id = _climb_root_inmem(message_id, merged_parents)
+            new_msgs, new_parents = _load_subtree(conn, new_root_id)
+            new_revision = _tree_revision(new_msgs, new_parents)
+
+            conn.commit()
+            return {
+                "message_id": message_id,
+                "old_parent_id": old_parent_id,
+                "new_parent_id": new_parent_id,
+                "old_root_id": old_root_id,
+                "new_root_id": new_root_id,
+                "revision": new_revision,
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
 # ---------------------------------------------------------------------------
