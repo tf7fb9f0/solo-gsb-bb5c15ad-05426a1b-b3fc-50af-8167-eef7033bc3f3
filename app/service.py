@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from . import database, threading
-from .schemas import BatchIn, CleanupIn, FreezeIn, RelinkIn, UnfreezeIn
+from .schemas import BatchIn, CleanupIn, FreezeIn, RelinkIn, ThreadCorrectionIn, UnfreezeIn
 from .threading import RetentionCleanupPlan, ThreadMessage
 
 
@@ -55,6 +55,40 @@ class RetentionAnchorInvalid(Exception):
 
 class RetentionFreezeNotFound(Exception):
     """解除冻结：不存在以该邮件为锚点的冻结（-> 404）。"""
+
+
+class CorrectionNotFound(Exception):
+    """POST /thread-corrections：待调整邮件或目标父节点未归档（-> 404）。"""
+
+    def __init__(self, message_id: str, role: str) -> None:
+        self.message_id = message_id
+        self.role = role  # "message" | "parent"
+        super().__init__(f"{role} not found: {message_id}")
+
+
+class CorrectionInvalid(Exception):
+    """POST /thread-corrections：待调整邮件或目标父节点是环内 invalid 邮件（-> 409）。"""
+
+    def __init__(self, message_id: str, role: str) -> None:
+        self.message_id = message_id
+        self.role = role  # "message" | "parent"
+        super().__init__(f"{role} is invalid: {message_id}")
+
+
+class CorrectionRevisionConflict(Exception):
+    """expected_revision 与当前整棵会话的 revision 不一致（-> 409，不写库）。"""
+
+    def __init__(self, current_revision: str) -> None:
+        self.current_revision = current_revision
+        super().__init__("expected_revision does not match the current thread revision")
+
+
+class CorrectionCycleConflict(Exception):
+    """按请求改挂后会形成引用环（含自挂），整次拒绝、不写库（-> 409）。"""
+
+    def __init__(self, cycles: list[list[str]]) -> None:
+        self.cycles = cycles
+        super().__init__(f"correction would create cycles: {cycles}")
 
 
 # 游标载荷版本号；编码结构调整时可据此区分。
@@ -119,6 +153,28 @@ def _load_subtree(conn: sqlite3.Connection, root_id: str) -> tuple[dict[str, Thr
         messages[mid] = _row_to_message(row)
         parent_of[mid] = row["parent_id"]
     return messages, parent_of
+
+
+def _tree_revision(
+    messages: dict[str, ThreadMessage],
+    parent_of: dict[str, Optional[str]],
+) -> str:
+    """根据整棵树的 message_id、parent_id、sent_at 生成 revision。
+
+    节点按 message_id 排序后逐行摘要，补链/纠偏改变父指针、新邮件并入树等
+    任何结构变化都会使摘要改变：GET /threads 把它暴露给调用方，分页游标与
+    POST /thread-corrections 的 expected_revision 都基于它做乐观并发校验。
+    """
+
+    digest = hashlib.sha256()
+    for mid in sorted(messages):
+        msg = messages[mid]
+        line = "\x1f".join(
+            [mid, parent_of.get(mid) or "", msg.sent_at]
+        )
+        digest.update(line.encode("utf-8"))
+        digest.update(b"\x1e")
+    return digest.hexdigest()
 
 
 def _build_payload(
@@ -478,6 +534,95 @@ def relink_messages(payload: RelinkIn) -> dict:
             conn.close()
 
 
+def correct_thread(payload: ThreadCorrectionIn) -> dict:
+    """人工会话纠偏：把某封有效邮件改挂到指定父节点（new_parent_id 为 None 拆成根）。
+
+    - 仅允许调整有效邮件，目标父节点也必须是有效邮件；
+    - expected_revision 必须与该邮件当前所在整棵会话的 revision 一致
+      （与 GET /threads/{message_id} 返回的 revision 同一算法），否则抛
+      CorrectionRevisionConflict（409），不写库；
+    - 禁止自挂与任何形式的引用环：把变更合并到全部有效邮件的父指针图上
+      统一检测环，成环则抛 CorrectionCycleConflict（409），不写库；
+    - 通过校验后在单事务内更新 parent_id，返回调整前后的父节点、根节点
+      以及调整后整棵会话的新 revision（基于写后同一事务视图计算）。
+    """
+
+    message_id = payload.message_id
+    new_parent_id = payload.new_parent_id
+
+    with database.write_lock():
+        conn = database.connect()
+        try:
+            # 单事务视图：校验、revision 计算与写入基于同一快照
+            conn.execute("BEGIN IMMEDIATE")
+
+            row = conn.execute(
+                "SELECT parent_id, is_invalid FROM messages WHERE message_id = ?",
+                (message_id,),
+            ).fetchone()
+            if row is None:
+                raise CorrectionNotFound(message_id, "message")
+            if row["is_invalid"]:
+                raise CorrectionInvalid(message_id, "message")
+
+            if new_parent_id is not None:
+                prow = conn.execute(
+                    "SELECT is_invalid FROM messages WHERE message_id = ?",
+                    (new_parent_id,),
+                ).fetchone()
+                if prow is None:
+                    raise CorrectionNotFound(new_parent_id, "parent")
+                if prow["is_invalid"]:
+                    raise CorrectionInvalid(new_parent_id, "parent")
+
+            # 当前整棵会话的 revision：与 GET /threads/{message_id} 一致
+            old_root_id = _climb_root(conn, message_id)
+            msgs, parents = _load_subtree(conn, old_root_id)
+            current_revision = _tree_revision(msgs, parents)
+            if payload.expected_revision != current_revision:
+                raise CorrectionRevisionConflict(current_revision)
+
+            old_parent_id = row["parent_id"]
+
+            # 合并到全部有效邮件的父指针图上统一检测环（含自挂）
+            base_parents: dict[str, Optional[str]] = {
+                r["message_id"]: r["parent_id"]
+                for r in conn.execute(
+                    "SELECT message_id, parent_id FROM messages WHERE is_invalid = 0"
+                )
+            }
+            merged_parents = dict(base_parents)
+            merged_parents[message_id] = new_parent_id
+            cycles = threading.find_cycles(merged_parents)
+            if cycles:
+                raise CorrectionCycleConflict(cycles)
+
+            new_root_id = _climb_root_inmem(message_id, merged_parents)
+
+            # 单事务写入；新 revision 基于写后同一事务视图计算
+            conn.execute(
+                "UPDATE messages SET parent_id = ? WHERE message_id = ?",
+                (new_parent_id, message_id),
+            )
+            new_msgs, new_parents = _load_subtree(conn, new_root_id)
+            new_revision = _tree_revision(new_msgs, new_parents)
+
+            conn.commit()
+            return {
+                "message_id": message_id,
+                "old_parent_id": old_parent_id,
+                "new_parent_id": new_parent_id,
+                "old_root_id": old_root_id,
+                "new_root_id": new_root_id,
+                "new_revision": new_revision,
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
 def list_batches(limit: int, offset: int) -> dict:
     conn = database.connect()
     try:
@@ -542,7 +687,7 @@ def get_message(message_id: str) -> Optional[dict]:
 
 
 def get_thread(message_id: str) -> Optional[dict]:
-    """返回某邮件所在会话的完整树。环邮件不挂接，返回 409。"""
+    """返回某邮件所在会话的完整树与当前 revision。环邮件不挂接，返回 409。"""
 
     conn = database.connect()
     try:
@@ -557,7 +702,11 @@ def get_thread(message_id: str) -> Optional[dict]:
         root_id = _climb_root(conn, message_id)
         msgs, parents = _load_subtree(conn, root_id)
         forest = threading.build_forest(msgs, parents)
-        return {"root_id": root_id, "tree": forest[0] if forest else None}
+        return {
+            "root_id": root_id,
+            "revision": _tree_revision(msgs, parents),
+            "tree": forest[0] if forest else None,
+        }
     finally:
         conn.close()
 
@@ -565,27 +714,6 @@ def get_thread(message_id: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 # GET /threads/{message_id}/page：稳定游标分页
 # ---------------------------------------------------------------------------
-
-
-def _tree_revision(
-    messages: dict[str, ThreadMessage],
-    parent_of: dict[str, Optional[str]],
-) -> str:
-    """根据整棵树的 message_id、parent_id、sent_at 生成 revision。
-
-    节点按 message_id 排序后逐行摘要，补链改变父指针、新邮件并入树等任何
-    结构变化都会使摘要改变，从而让旧游标失效。
-    """
-
-    digest = hashlib.sha256()
-    for mid in sorted(messages):
-        msg = messages[mid]
-        line = "\x1f".join(
-            [mid, parent_of.get(mid) or "", msg.sent_at]
-        )
-        digest.update(line.encode("utf-8"))
-        digest.update(b"\x1e")
-    return digest.hexdigest()
 
 
 def _encode_cursor(root_id: str, offset: int, revision: str) -> str:

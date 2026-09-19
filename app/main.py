@@ -20,6 +20,8 @@ from .schemas import (
     MessageOut,
     RelinkIn,
     RelinkResult,
+    ThreadCorrectionIn,
+    ThreadCorrectionResult,
     UnfreezeIn,
     UnfreezeResult,
 )
@@ -33,10 +35,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.app_title,
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "批量提交邮件头信息，归并为稳定排序的会话树，诊断重复 ID / 缺失引用 / 引用环；"
-        "支持邮件保留期（retain_until）、会话活跃冻结/解除冻结与到期批量清理。"
+        "支持邮件保留期（retain_until）、会话活跃冻结/解除冻结与到期批量清理；"
+        "支持人工会话纠偏（POST /thread-corrections，revision 乐观并发）。"
     ),
     lifespan=lifespan,
 )
@@ -123,7 +126,7 @@ def get_message(message_id: str) -> dict:
 @app.get(
     "/threads/{message_id}",
     tags=["threads"],
-    summary="查询某邮件所属的完整会话树",
+    summary="查询某邮件所属的完整会话树（含当前 revision）",
 )
 def get_thread(message_id: str) -> dict:
     result = service.get_thread(message_id)
@@ -172,6 +175,62 @@ def get_thread_page(
             detail="message belongs to a reference cycle and is not attached to any thread",
         )
     return result
+
+
+# ---------------------------------------------------------------------------
+# 人工会话纠偏：POST /thread-corrections
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/thread-corrections",
+    response_model=ThreadCorrectionResult,
+    tags=["threads"],
+    summary="人工会话纠偏：把某封有效邮件改挂到新的父节点（null 表示拆成根）",
+)
+def correct_thread(payload: ThreadCorrectionIn) -> dict:
+    try:
+        return service.correct_thread(payload)
+    except service.CorrectionNotFound as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": (
+                    "message not found" if exc.role == "message"
+                    else "new parent not found"
+                ),
+                "message_id": exc.message_id,
+            },
+        )
+    except service.CorrectionInvalid as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    "message belongs to a reference cycle and is not attached to any thread"
+                    if exc.role == "message"
+                    else "new parent belongs to a reference cycle and is not attached to any thread"
+                ),
+                "message_id": exc.message_id,
+            },
+        )
+    except service.CorrectionRevisionConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "revision_conflict",
+                "message": "expected_revision does not match the current thread revision; no changes were written",
+                "current_revision": exc.current_revision,
+            },
+        )
+    except service.CorrectionCycleConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "correction would create a reference cycle; no changes were written",
+                "cycles": exc.cycles,
+            },
+        )
 
 
 # ---------------------------------------------------------------------------

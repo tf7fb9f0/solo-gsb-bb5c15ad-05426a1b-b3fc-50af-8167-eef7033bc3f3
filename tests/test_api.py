@@ -1124,3 +1124,255 @@ def test_init_db_migrates_legacy_snapshot_table(tmp_path):
         assert "retain_until" in columns                 # 补列迁移仍生效
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# POST /thread-corrections：人工会话纠偏（revision 乐观并发）
+# ---------------------------------------------------------------------------
+
+
+def _seed_correction_forest(client):
+    """R -> A -> C -> E；R -> D。另有一棵独立树 P -> Q。"""
+    client.post("/batches", json={"messages": [
+        _m("R", sent="2026-09-18T08:00:00+00:00"),
+        _m("A", irt="R", refs=["R"], sent="2026-09-18T09:00:00+00:00"),
+        _m("C", irt="A", refs=["R", "A"], sent="2026-09-18T10:00:00+00:00"),
+        _m("E", irt="C", refs=["C"], sent="2026-09-18T10:30:00+00:00"),
+        _m("D", irt="R", refs=["R"], sent="2026-09-18T11:00:00+00:00"),
+        _m("P", sent="2026-09-17T08:00:00+00:00"),
+        _m("Q", irt="P", refs=["P"], sent="2026-09-17T09:00:00+00:00"),
+    ]})
+
+
+def _correct(client, message_id, new_parent_id, revision):
+    return client.post("/thread-corrections", json={
+        "message_id": message_id,
+        "new_parent_id": new_parent_id,
+        "expected_revision": revision,
+    })
+
+
+def test_thread_response_includes_stable_revision(client):
+    _seed_correction_forest(client)
+    t1 = client.get("/threads/C").json()
+    t2 = client.get("/threads/C").json()
+    assert t1["root_id"] == "R"
+    assert t1["revision"] == t2["revision"]
+    assert len(t1["revision"]) == 64  # sha256 hex
+    # 不同会话的 revision 不同
+    assert client.get("/threads/P").json()["revision"] != t1["revision"]
+
+
+def test_correction_reparents_within_thread_and_returns_new_revision(client):
+    _seed_correction_forest(client)
+    rev = client.get("/threads/C").json()["revision"]
+
+    r = _correct(client, "C", "D", rev)
+    assert r.status_code == 200
+    body = r.json()
+    assert body == {
+        "message_id": "C",
+        "old_parent_id": "A",
+        "new_parent_id": "D",
+        "old_root_id": "R",
+        "new_root_id": "R",
+        "new_revision": body["new_revision"],
+    }
+    assert body["new_revision"] != rev
+
+    # 新 revision 与 GET /threads 随即返回的一致；结构立即反映
+    t = client.get("/threads/C").json()
+    assert t["revision"] == body["new_revision"]
+    assert client.get("/messages/C").json()["parent_id"] == "D"
+    assert client.get("/messages/E").json()["parent_id"] == "C"
+    d = [c for c in t["tree"]["children"] if c["message_id"] == "D"][0]
+    assert [g["message_id"] for g in d["children"]] == ["C"]
+    assert [g["message_id"] for g in d["children"][0]["children"]] == ["E"]
+    # A 下已无子节点
+    a = [c for c in t["tree"]["children"] if c["message_id"] == "A"][0]
+    assert a["children"] == []
+
+
+def test_correction_detach_to_root_splits_thread(client):
+    _seed_correction_forest(client)
+    rev = client.get("/threads/E").json()["revision"]
+    body = _correct(client, "C", None, rev).json()
+    assert body["old_parent_id"] == "A"
+    assert body["new_parent_id"] is None
+    assert body["old_root_id"] == "R"
+    assert body["new_root_id"] == "C"
+
+    # C 携子树 E 成为独立会话
+    t = client.get("/threads/C").json()
+    assert t["root_id"] == "C"
+    assert t["revision"] == body["new_revision"]
+    assert t["tree"]["message_id"] == "C"
+    assert [c["message_id"] for c in t["tree"]["children"]] == ["E"]
+    # 原树剩余部分不变
+    assert client.get("/threads/A").json()["root_id"] == "R"
+    assert client.get("/threads/D").json()["root_id"] == "R"
+
+
+def test_correction_merges_whole_subtree_into_other_thread(client):
+    _seed_correction_forest(client)
+    rev = client.get("/threads/R").json()["revision"]
+    body = _correct(client, "R", "Q", rev).json()
+    assert body["old_parent_id"] is None
+    assert body["new_parent_id"] == "Q"
+    assert body["old_root_id"] == "R"
+    assert body["new_root_id"] == "P"
+
+    # 整棵 R 子树并入 P 会话：P -> Q -> R -> ...
+    t = client.get("/threads/A").json()
+    assert t["root_id"] == "P"
+    assert t["revision"] == body["new_revision"]
+    q = t["tree"]["children"][0]
+    assert q["message_id"] == "Q"
+    assert q["children"][0]["message_id"] == "R"
+    assert sorted(c["message_id"] for c in q["children"][0]["children"]) == ["A", "D"]
+
+
+def test_correction_revision_mismatch_returns_409_and_writes_nothing(client):
+    _seed_correction_forest(client)
+    rev = client.get("/threads/C").json()["revision"]
+
+    # 先发一次成功纠偏改变拓扑，旧 revision 立即失效
+    assert _correct(client, "C", "D", rev).status_code == 200
+
+    r = _correct(client, "C", "Q", rev)
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["error"] == "revision_conflict"
+    assert detail["current_revision"] == client.get("/threads/C").json()["revision"]
+    # 不写库：父节点保持第一次纠偏后的值
+    assert client.get("/messages/C").json()["parent_id"] == "D"
+
+    # 编造的 revision 同样 409 且不写库
+    r2 = _correct(client, "C", "Q", "0" * 64)
+    assert r2.status_code == 409
+    assert r2.json()["detail"]["error"] == "revision_conflict"
+    assert client.get("/messages/C").json()["parent_id"] == "D"
+
+
+def test_correction_unknown_message_or_parent_returns_404(client):
+    _seed_correction_forest(client)
+    rev = client.get("/threads/C").json()["revision"]
+    r = _correct(client, "ghost", "D", rev)
+    assert r.status_code == 404
+    assert r.json()["detail"]["message_id"] == "ghost"
+
+    r2 = _correct(client, "C", "ghost", rev)
+    assert r2.status_code == 404
+    assert r2.json()["detail"]["message_id"] == "ghost"
+    assert client.get("/messages/C").json()["parent_id"] == "A"
+
+
+def test_correction_invalid_message_or_parent_returns_409(client):
+    client.post("/batches", json={"messages": [
+        _m("R", sent="2026-09-18T08:00:00+00:00"),
+        _m("x", irt="y", refs=["y"], sent="2026-09-18T12:00:00+00:00"),
+        _m("y", irt="x", refs=["x"], sent="2026-09-18T13:00:00+00:00"),
+    ]})
+    rev = client.get("/threads/R").json()["revision"]
+    # 环内 invalid 邮件不可调整（revision 校验之前即拒绝）
+    r = _correct(client, "x", "R", "0" * 64)
+    assert r.status_code == 409
+    assert r.json()["detail"]["message_id"] == "x"
+    # 环内 invalid 邮件不可作为目标父节点
+    r2 = _correct(client, "R", "x", rev)
+    assert r2.status_code == 409
+    assert r2.json()["detail"]["message_id"] == "x"
+    assert client.get("/messages/R").json()["parent_id"] is None
+
+
+def test_correction_self_parent_is_rejected_as_cycle(client):
+    _seed_correction_forest(client)
+    rev = client.get("/threads/C").json()["revision"]
+    r = _correct(client, "C", "C", rev)
+    assert r.status_code == 409
+    assert r.json()["detail"]["cycles"] == [["C"]]
+    assert client.get("/messages/C").json()["parent_id"] == "A"
+
+
+def test_correction_under_own_descendant_is_rejected_as_cycle(client):
+    _seed_correction_forest(client)
+    rev = client.get("/threads/R").json()["revision"]
+    # R 挂到自己的后代 E 之下 -> R->E->C->A->R 成环，整次拒绝、不写库
+    r = _correct(client, "R", "E", rev)
+    assert r.status_code == 409
+    assert r.json()["detail"]["cycles"] == [["A", "R", "E", "C"]]
+    assert client.get("/messages/R").json()["parent_id"] is None
+    assert client.get("/threads/R").json()["revision"] == rev
+
+
+def test_correction_blank_fields_rejected(client):
+    assert client.post("/thread-corrections", json={
+        "message_id": "  ", "new_parent_id": None, "expected_revision": "x",
+    }).status_code == 422
+    assert client.post("/thread-corrections", json={
+        "message_id": "A", "new_parent_id": None, "expected_revision": "  ",
+    }).status_code == 422
+    assert client.post("/thread-corrections", json={
+        "message_id": "A", "new_parent_id": None,
+    }).status_code == 422
+
+
+def test_correction_noop_same_parent_keeps_revision(client):
+    _seed_correction_forest(client)
+    rev = client.get("/threads/C").json()["revision"]
+    body = _correct(client, "C", "A", rev).json()
+    assert body["old_parent_id"] == "A"
+    assert body["new_parent_id"] == "A"
+    assert body["old_root_id"] == body["new_root_id"] == "R"
+    assert body["new_revision"] == rev  # 拓扑未变，revision 不变
+
+
+def test_correction_keeps_batch_snapshots_unchanged(client):
+    b = client.post("/batches", json={"messages": [
+        _m("R", sent="2026-09-18T08:00:00+00:00"),
+        _m("A", irt="R", refs=["R"], sent="2026-09-18T09:00:00+00:00"),
+    ]}).json()
+    rev = client.get("/threads/A").json()["revision"]
+    assert _correct(client, "A", None, rev).status_code == 200
+    # 批次快照保持归档时原样（A 仍挂在 R 下）
+    assert client.get(f"/batches/{b['batch_id']}").json() == b
+
+
+def test_thread_page_cursor_is_stale_after_correction(client):
+    _seed_correction_forest(client)
+    cur = client.get("/threads/R/page", params={"limit": 2}).json()["next_cursor"]
+    rev = client.get("/threads/R").json()["revision"]
+    assert _correct(client, "C", "D", rev).status_code == 200
+    r = client.get("/threads/R/page", params={"limit": 2, "cursor": cur})
+    assert r.status_code == 409
+    assert r.json()["detail"]["error"] == "cursor_stale"
+
+
+def test_correction_moves_freeze_protection_with_new_topology(client):
+    # R(到期) -> A；独立树 P -> Q，冻结 Q（保护 P/Q）
+    client.post("/batches", json={"messages": [
+        _m("R", sent="2026-09-18T08:00:00+00:00",
+           retain_until="2026-09-19T00:00:00+00:00"),
+        _m("A", irt="R", refs=["R"], sent="2026-09-18T09:00:00+00:00"),
+        _m("P", sent="2026-09-17T08:00:00+00:00"),
+        _m("Q", irt="P", refs=["P"], sent="2026-09-17T09:00:00+00:00"),
+    ]})
+    client.post("/retention/freezes", json={"message_id": "Q"})
+    assert client.get("/messages/R").json()["frozen"] is False
+
+    # 纠偏并入被冻结会话：R/A 自动受保护，到期不删
+    rev = client.get("/threads/R").json()["revision"]
+    body = _correct(client, "R", "Q", rev).json()
+    assert body["new_root_id"] == "P"
+    assert client.get("/messages/R").json()["frozen"] is True
+    assert client.get("/messages/A").json()["frozen"] is True
+    assert client.post(
+        "/retention/cleanups", json={"cutoff": CUTOFF}
+    ).json()["deleted_ids"] == []
+
+    # 再拆回根：离开冻结会话，保护随之消失，到期即清理
+    rev2 = client.get("/threads/R").json()["revision"]
+    assert _correct(client, "R", None, rev2).status_code == 200
+    assert client.get("/messages/R").json()["frozen"] is False
+    out = client.post("/retention/cleanups", json={"cutoff": CUTOFF}).json()
+    assert out["deleted_ids"] == ["R"]

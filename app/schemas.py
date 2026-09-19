@@ -162,6 +162,52 @@ class RelinkResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# 人工会话纠偏：POST /thread-corrections
+# ---------------------------------------------------------------------------
+
+
+class ThreadCorrectionIn(BaseModel):
+    """POST /thread-corrections：人工把某封有效邮件改挂到新父节点（null 拆成根）。"""
+
+    message_id: str = Field(..., min_length=1, description="待调整的邮件 ID（必须为有效邮件）")
+    new_parent_id: Optional[str] = Field(
+        None, description="目标父节点 ID（必须为有效邮件）；null 表示拆成根"
+    )
+    expected_revision: str = Field(
+        ...,
+        min_length=1,
+        description="GET /threads/{message_id} 返回的当前 revision；不一致返回 409 且不写库",
+    )
+
+    @field_validator("message_id", "expected_revision")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("must not be empty")
+        return v
+
+    @field_validator("new_parent_id")
+    @classmethod
+    def _strip_parent(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
+
+
+class ThreadCorrectionResult(BaseModel):
+    message_id: str
+    old_parent_id: Optional[str]
+    new_parent_id: Optional[str]
+    old_root_id: str
+    new_root_id: str
+    new_revision: str = Field(
+        ..., description="调整后该邮件所在整棵会话的 revision（与 GET /threads 随即返回值一致）"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 保留期：会话冻结 / 解除冻结 / 批量清理
 # ---------------------------------------------------------------------------
 
